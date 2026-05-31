@@ -55,19 +55,70 @@ METRIC_LABELS = {
     "proved_reserves": "Proved Reserves",
 }
 
+TRUST_METRIC_LABELS = {
+    "revenue":         "Royalty Income",
+    "ebitda":          "EBITDA (est.)",
+    "net_income":      "Distributable Income",
+    "total_assets":    "Total Assets",
+    "total_debt":      "Total Debt",
+    "cash":            "Cash",
+    "equity":          "Trust Corpus",
+    "pv10":            "PV-10 (Std. Measure)",
+    "proved_reserves": "Proved Reserves",
+}
+
 # ---------------------------------------------------------------------------
 # EDGAR lookup helpers
 # ---------------------------------------------------------------------------
 
+# Known tickers that EDGAR doesn't register but whose CIKs are stable
+_KNOWN_CIKS: dict[str, tuple[str, str]] = {
+    "BPT":   ("0000850033", "BP PRUDHOE BAY ROYALTY TRUST"),
+    "SDT":   ("0001521168", "SANDRIDGE PERMIAN TRUST"),
+    "TIRTZ": ("0001581552", "TORCHLIGHT ENERGY ROYALTY TRUST"),
+}
+
+
 def get_cik(ticker: str) -> tuple[str, str]:
     """Return (cik_padded, company_name) for a ticker."""
+    ticker_upper = ticker.upper()
+
+    # 1. Manual override for tickers EDGAR doesn't index
+    if ticker_upper in _KNOWN_CIKS:
+        cik, name = _KNOWN_CIKS[ticker_upper]
+        return cik.zfill(10), name
+
+    # 2. Standard company_tickers.json
     url = "https://www.sec.gov/files/company_tickers.json"
     r = requests.get(url, headers=HTML_HEADERS, timeout=15)
     r.raise_for_status()
-    ticker_upper = ticker.upper()
     for entry in r.json().values():
         if entry["ticker"].upper() == ticker_upper:
             return str(entry["cik_str"]).zfill(10), entry["title"]
+
+    # 3. Broader exchange file (includes OTC / pink-sheet tickers)
+    r2 = requests.get("https://www.sec.gov/files/company_tickers_exchange.json",
+                      headers=HTML_HEADERS, timeout=15)
+    if r2.ok:
+        for row in r2.json().get("data", []):
+            # row: [cik, name, ticker, exchange]
+            if len(row) >= 3 and str(row[2]).upper() == ticker_upper:
+                return str(row[0]).zfill(10), str(row[1])
+
+    # 4. Full-text EDGAR search by ticker symbol
+    r3 = requests.get(
+        f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker_upper}%22&forms=10-K",
+        headers=HTML_HEADERS, timeout=10,
+    )
+    if r3.ok:
+        hits = r3.json().get("hits", {}).get("hits", [])
+        for h in hits:
+            src = h.get("_source", {})
+            entity_id = src.get("entity_id") or src.get("cik")
+            entity_name = src.get("entity_name", "")
+            if entity_id:
+                return str(entity_id).zfill(10), entity_name
+
     raise ValueError(f"Ticker '{ticker}' not found in SEC EDGAR.")
 
 
@@ -397,6 +448,237 @@ def scrape_pv10_and_reserves(html_text: str) -> tuple[Optional[float], Optional[
 
 
 # ---------------------------------------------------------------------------
+# Royalty trust detection & HTML scraping
+# ---------------------------------------------------------------------------
+
+# Trust SIC codes + name keywords
+_TRUST_SIC = {"6792", "6726"}
+
+
+def is_royalty_trust(company_name: str, sic: str, facts: dict) -> bool:
+    """
+    Detect royalty trusts, which file under modified cash basis with no/minimal XBRL.
+    """
+    name_lower = company_name.lower()
+    if "royalty trust" in name_lower or "oil royalty" in name_lower:
+        return True
+    if sic in _TRUST_SIC:
+        return True
+    # No XBRL data at all — strong signal for legacy trust filers
+    gaap = facts.get("facts", {}).get("us-gaap", {})
+    tagged = sum(1 for v in gaap.values()
+                 if any(e.get("form") in ("10-K", "10-K/A")
+                        for e in v.get("units", {}).get("USD", [])))
+    return tagged == 0
+
+
+def _scrape_trust_row(soup: BeautifulSoup, label_patterns: list[str],
+                      max_cols: int = 3, min_val: float = 0,
+                      prefer_largest: bool = False) -> list[float]:
+    """
+    Find a table row matching any label pattern and return up to max_cols
+    numeric values (left-to-right = most-recent year first).
+    Handles trust tables where dollar signs occupy their own <td>.
+    Skips rows where the largest value is <= min_val (e.g. TOC page numbers).
+    If prefer_largest=True, scans ALL matching rows and returns the one with
+    the largest max value (useful when 'total' appears as multiple subtotals).
+    """
+    best: list[float] = []
+    for tag in soup.find_all(["td", "th"]):
+        cell_text = tag.get_text(" ", strip=True).lower()
+        if not any(re.search(p, cell_text) for p in label_patterns):
+            continue
+        row = tag.find_parent("tr")
+        if not row:
+            continue
+        cells = list(row.find_all(["td", "th"]))
+        try:
+            start = cells.index(tag) + 1
+        except ValueError:
+            continue
+        vals = []
+        for td in cells[start:]:
+            t = td.get_text(" ", strip=True)
+            v = _parse_num(t)
+            if v is not None and abs(v) > 0:
+                vals.append(v)
+            if len(vals) >= max_cols:
+                break
+        # Skip rows whose values are all <= min_val (page numbers / tiny totals)
+        if vals and max(abs(v) for v in vals) <= min_val:
+            continue
+        if vals:
+            if not prefer_largest:
+                return vals
+            if not best or max(abs(v) for v in vals) > max(abs(v) for v in best):
+                best = vals
+    return best
+
+
+def _plain_multi(plain: str, label: str, max_vals: int = 3) -> list[float]:
+    """
+    Regex fallback: find label in plain text, collect the next `max_vals`
+    numbers that follow dollar signs.  Works for trusts whose tables
+    render as   label … $ nnn,nnn  $ nnn,nnn  …
+    """
+    idx = plain.lower().find(label.lower())
+    if idx < 0:
+        return []
+    snippet = plain[idx: idx + 600]
+    # find numbers preceded by $
+    hits = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', snippet)
+    results = []
+    for h in hits:
+        try:
+            v = float(h.replace(",", ""))
+            if v > 0:
+                results.append(v)
+        except ValueError:
+            pass
+        if len(results) >= max_vals:
+            break
+    # If no $ signs, fall back to any large numbers
+    if not results:
+        nums = re.findall(r'\b([\d,]{4,}(?:\.\d+)?)\b', snippet)
+        for n in nums:
+            try:
+                v = float(n.replace(",", ""))
+                if v > 1_000:
+                    results.append(v)
+            except ValueError:
+                pass
+            if len(results) >= max_vals:
+                break
+    return results
+
+
+def scrape_trust_all_years(
+    html_text: str,
+    filing_fiscal_year: str,
+    is_oil_gas: bool,
+) -> dict[str, dict]:
+    """
+    Parse a trust 10-K and extract up to 3 years of data from its
+    comparative financial statements.  Returns {fiscal_year: metrics_dict}.
+
+    Trust-specific terminology mapped to our standard keys:
+        revenue       ← Royalty Income / Trust Income
+        net_income    ← Distributable Income
+        equity        ← Trust Corpus (end of year)
+        total_assets  ← Total Assets (or Royalty Properties + Cash)
+        cash          ← Cash / Cash and Cash Equivalents
+        total_debt    ← 0 (trusts carry no debt)
+        ebitda        ← None (not applicable)
+    """
+    soup  = BeautifulSoup(html_text, "html.parser")
+    plain = soup.get_text(" ")
+
+    # Royalty trusts ALWAYS report in whole dollars — never apply a scale multiplier.
+    # (Phrases like "expressed in millions of cubic feet" refer to reserves units,
+    #  not the financial statement currency, and must not affect dollar scale.)
+    scale = 1
+
+    def pick(patterns: list[str], n: int = 3, min_val: float = 0,
+             prefer_largest: bool = False) -> list[float]:
+        vals = _scrape_trust_row(soup, patterns, max_cols=n, min_val=min_val,
+                                 prefer_largest=prefer_largest)
+        if not vals:
+            for pat in patterns:
+                vals = _plain_multi(plain, pat, max_vals=n)
+                if vals:
+                    break
+        return vals
+
+    # --- Income statement (3-year comparative) ---
+    # Use min_val=1000 to skip TOC rows (page numbers).
+    # Use ^royalty income so "Future Royalty income" in oil/gas supplementals is skipped.
+    revenue_vals    = pick([r"^royalty income", r"^trust income", r"^total income\b"],
+                           min_val=1000)
+    if not revenue_vals:
+        revenue_vals = pick([r"royalty income", r"trust income"], min_val=1000)
+    net_income_vals = pick([r"^distributable income$", r"^distributable income\b"],
+                           min_val=1000)
+    if not net_income_vals:
+        net_income_vals = pick([r"distributable income", r"net income",
+                                r"income available"], min_val=1000)
+
+    # --- Balance sheet (2-year comparative) ---
+    cash_vals = pick([r"cash and cash equiv", r"^cash\b"], n=2)
+
+    # Trust corpus: "trust corpus$" would match TOC entry "Statements of Changes in
+    # Trust Corpus", so anchor with ^ and require min_val to skip page numbers.
+    corpus_vals = pick([r"trust corpus, end of year", r"^trust corpus\b",
+                        r"corpus, end of year"], n=2, min_val=1000)
+
+    liabilities_vals = pick([r"^total liabilities\b", r"total liabilities"], n=2)
+    royalty_prop     = pick([r"royalty properties", r"net overriding royalty",
+                             r"net royalty interests"], n=2)
+
+    # Total assets: try explicit label first (many trusts use bare "Total").
+    # Avoid prefer_largest — income statement totals are larger than balance-sheet totals.
+    # Instead, derive from balance-sheet components when the label is absent.
+    assets_vals = pick([r"^total assets\b", r"total assets"], n=2)
+    if not assets_vals and corpus_vals and liabilities_vals:
+        # Most reliable: balance sheet identity (Assets = Equity + Liabilities)
+        assets_vals = [c + l for c, l in zip(corpus_vals, liabilities_vals)]
+    if not assets_vals:
+        # Last resort: "Total" row — take the FIRST one with plausible size
+        assets_vals = pick([r"^total\b"], n=2, min_val=100_000)
+    if not assets_vals and royalty_prop and cash_vals:
+        assets_vals = [r + c for r, c in zip(royalty_prop, cash_vals)]
+
+    # Sanity check: total assets must be >= trust corpus.  If not, we grabbed
+    # an intermediate subtotal (e.g. royalty income total); fall back to derivation.
+    if (assets_vals and corpus_vals
+            and assets_vals[0] < corpus_vals[0] * 0.90):
+        if liabilities_vals:
+            assets_vals = [c + l for c, l in zip(corpus_vals, liabilities_vals)]
+        else:
+            assets_vals = []
+
+    # --- Oil & gas supplemental (most recent year only from this filing) ---
+    pv10_raw, reserves_raw = (None, None)
+    if is_oil_gas:
+        pv10_html, res_html = scrape_pv10_and_reserves(html_text)
+        if pv10_html is not None:
+            pv10_raw = pv10_html * scale
+        reserves_raw = res_html
+
+    # --- Map columns → fiscal years ---
+    base_year = int(filing_fiscal_year)
+    result: dict[str, dict] = {}
+
+    def _safe(lst: list[float], i: int) -> Optional[float]:
+        return lst[i] if i < len(lst) else None
+
+    for offset in range(3):
+        yr = str(base_year - offset)
+        revenue    = _safe(revenue_vals, offset)
+        net_income = _safe(net_income_vals, offset)
+        cash       = _safe(cash_vals, offset)
+        assets     = _safe(assets_vals, offset)
+        corpus     = _safe(corpus_vals, offset)
+
+        # Apply scale → whole dollars → convert to $thousands
+        def ths(v: Optional[float]) -> Optional[float]:
+            return to_thousands(v * scale) if v is not None else None
+
+        result[yr] = {
+            "revenue":         ths(revenue),
+            "ebitda":          None,         # not applicable for trusts
+            "net_income":      ths(net_income),
+            "total_assets":    ths(assets),
+            "total_debt":      0.0,          # trusts have no debt by design
+            "cash":            ths(cash),
+            "equity":          ths(corpus),
+            "pv10":            to_thousands(pv10_raw) if offset == 0 else None,
+            "proved_reserves": reserves_raw   if offset == 0 else None,
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Per-year data extraction
 # ---------------------------------------------------------------------------
 
@@ -571,15 +853,22 @@ def print_company_table(
     ticker: str,
     company_name: str,
     is_oil_gas: bool,
-    years_data: list[tuple[str, dict]],   # [(fiscal_year, metrics), ...]
+    years_data: list[tuple[str, dict]],
+    is_trust: bool = False,
 ) -> None:
     year_labels = [f"FY{fy}" for fy, _ in years_data]
-    metrics = [k for k in METRIC_KEYS if is_oil_gas or k not in ("pv10", "proved_reserves")]
+    labels = TRUST_METRIC_LABELS if is_trust else METRIC_LABELS
+    show_og = is_oil_gas or is_trust  # trusts may have PV-10/reserves
+    metrics = [k for k in METRIC_KEYS
+               if show_og or k not in ("pv10", "proved_reserves")]
+    # Trusts: hide EBITDA (always N/A) and Total Debt (always 0, not interesting)
+    if is_trust:
+        metrics = [k for k in metrics if k not in ("ebitda",)]
 
     header = ["Metric (USD Millions)"] + year_labels
     rows = []
     for key in metrics:
-        label = METRIC_LABELS[key]
+        label = labels[key]
         is_res = (key == "proved_reserves")
         row = [label] + [fmt_thousands(data.get(key), is_reserves=is_res)
                          for _, data in years_data]
@@ -587,11 +876,15 @@ def print_company_table(
 
     width = 57 + 14 * len(years_data)
     print(f"\n{'=' * width}")
-    print(f"  {ticker.upper()} — {company_name}")
+    trust_tag = " [Royalty Trust]" if is_trust else ""
+    print(f"  {ticker.upper()} — {company_name}{trust_tag}")
     print(f"{'=' * width}")
     print(tabulate(rows, headers=header, tablefmt="rounded_outline"))
-    print("\n  * EBITDA = Operating Income + D&A (same fiscal year)")
-    if is_oil_gas:
+    if is_trust:
+        print("\n  * Modified cash basis — no EBITDA; Equity = Trust Corpus end-of-year")
+    else:
+        print("\n  * EBITDA = Operating Income + D&A (same fiscal year)")
+    if is_oil_gas or is_trust:
         print("  * PV-10 = Standardized Measure of Discounted Future Net Cash Flows")
         print("  * Proved Reserves in filing units (MMBoe or Bcfe)")
     print()
@@ -602,7 +895,7 @@ def print_company_table(
 # ---------------------------------------------------------------------------
 
 def export_excel(
-    all_results: list[tuple[str, str, bool, list[tuple[str, dict]]]],
+    all_results: list[tuple[str, str, bool, list[tuple[str, dict]], bool]],
     path: str,
 ) -> None:
     """
@@ -642,18 +935,23 @@ def export_excel(
         if num_fmt:
             cell.number_format = num_fmt
 
-    for ticker, company_name, is_oil_gas, years_data in all_results:
+    for ticker, company_name, is_oil_gas, years_data, is_trust in all_results:
         ws = wb.create_sheet(title=ticker.upper()[:31])
         ws.sheet_view.showGridLines = False
 
         fiscal_years = [fy for fy, _ in years_data]
+        labels = TRUST_METRIC_LABELS if is_trust else METRIC_LABELS
+        show_og = is_oil_gas or is_trust
         metrics = [k for k in METRIC_KEYS
-                   if is_oil_gas or k not in ("pv10", "proved_reserves")]
+                   if show_og or k not in ("pv10", "proved_reserves")]
+        if is_trust:
+            metrics = [k for k in metrics if k not in ("ebitda",)]
 
         # --- Row 1: company banner ---
         ws.merge_cells(start_row=1, start_column=1,
                        end_row=1, end_column=1 + len(fiscal_years))
-        banner = ws.cell(1, 1, f"{ticker.upper()} — {company_name}")
+        trust_tag = " [Royalty Trust]" if is_trust else ""
+        banner = ws.cell(1, 1, f"{ticker.upper()} — {company_name}{trust_tag}")
         style_cell(banner, bold=True, bg=HEADER_BG, fg=HEADER_FG, align="center")
         ws.row_dimensions[1].height = 20
 
@@ -678,7 +976,7 @@ def export_excel(
             is_og_only = key in ("pv10", "proved_reserves")
             label_bg   = OG_LABEL_BG if is_og_only else (ALT_BG if row_i % 2 == 0 else None)
 
-            label_cell = ws.cell(row_i, 1, METRIC_LABELS[key])
+            label_cell = ws.cell(row_i, 1, labels[key])
             style_cell(label_cell, bold=True, bg=label_bg, align="left")
 
             for col_i, (fy, data) in enumerate(years_data, start=2):
@@ -707,14 +1005,23 @@ def export_excel(
         note_row = 4 + len(metrics) + 1
         ws.merge_cells(start_row=note_row, start_column=1,
                        end_row=note_row, end_column=1 + len(fiscal_years))
-        notes = [
-            "Notes:",
-            "• EBITDA estimated as Operating Income + D&A, matched within the same fiscal year.",
-            "• Source: SEC EDGAR XBRL data (data.sec.gov); oil & gas supplemental via HTML parsing.",
-        ]
-        if is_oil_gas:
-            notes.append("• PV-10 = Standardized Measure of Discounted Future Net Cash Flows.")
-            notes.append("• Proved Reserves in filing units (MMBoe or Bcfe — verify per filing).")
+        if is_trust:
+            notes = [
+                "Notes:",
+                "• Modified cash basis — EBITDA not applicable; Equity = Trust Corpus end-of-year.",
+                "• Source: SEC EDGAR 10-K HTML (trusts do not file XBRL); multi-year from comparative statements.",
+                "• PV-10 = Standardized Measure of Discounted Future Net Cash Flows (most recent year only).",
+                "• Proved Reserves in filing units (MMBoe or Bcfe).",
+            ]
+        else:
+            notes = [
+                "Notes:",
+                "• EBITDA estimated as Operating Income + D&A, matched within the same fiscal year.",
+                "• Source: SEC EDGAR XBRL data (data.sec.gov); oil & gas supplemental via HTML parsing.",
+            ]
+            if is_oil_gas:
+                notes.append("• PV-10 = Standardized Measure of Discounted Future Net Cash Flows.")
+                notes.append("• Proved Reserves in filing units (MMBoe or Bcfe — verify per filing).")
         note_cell = ws.cell(note_row, 1, "  ".join(notes))
         style_cell(note_cell, fg="595959", bg="F9F9F9", wrap=True)
         ws.row_dimensions[note_row].height = 60
@@ -727,10 +1034,12 @@ def export_excel(
 # Main per-ticker extraction
 # ---------------------------------------------------------------------------
 
-def extract_ticker(ticker: str, num_years: int) -> tuple[str, str, bool, list[tuple[str, dict]]]:
+def extract_ticker(
+    ticker: str, num_years: int
+) -> tuple[str, str, bool, list[tuple[str, dict]], bool]:
     """
     Fetch and extract data for one ticker.
-    Returns (ticker, company_name, is_oil_gas, [(fiscal_year, metrics), ...]).
+    Returns (ticker, company_name, is_oil_gas, [(fiscal_year, metrics), ...], is_trust).
     """
     print(f"\n{'─'*55}")
     print(f"  {ticker.upper()}")
@@ -740,8 +1049,8 @@ def extract_ticker(ticker: str, num_years: int) -> tuple[str, str, bool, list[tu
     print(f"  Company : {company_name}")
     print(f"  CIK     : {int(cik)}")
 
-    info    = get_company_info(cik)
-    sic     = str(info.get("sic", ""))
+    info       = get_company_info(cik)
+    sic        = str(info.get("sic", ""))
     is_oil_gas = sic in OIL_GAS_SIC
     if is_oil_gas:
         print(f"  SIC {sic} — Oil & Gas company detected.")
@@ -752,32 +1061,97 @@ def extract_ticker(ticker: str, num_years: int) -> tuple[str, str, bool, list[tu
 
     print("  Fetching XBRL facts...")
     facts = get_company_facts(cik)
-    ebitda_series = _build_ebitda_series(facts)
 
+    # --- Trust detection ---
+    trust_flag = is_royalty_trust(company_name, sic, facts)
+    if trust_flag:
+        print("  Royalty Trust detected — switching to HTML scrape mode.")
+        return _extract_trust(ticker, company_name, cik, is_oil_gas, filings, num_years)
+
+    # --- Standard XBRL path ---
+    ebitda_series = _build_ebitda_series(facts)
     years_data: list[tuple[str, dict]] = []
     for i, filing in enumerate(filings):
         fy   = filing["fiscal_year"]
         acc  = filing["accession"]
         orig = filing["original_accession"]
-        # HTML scrape only for the most recent year — it's slow and historical
-        # XBRL data covers most prior years for major filers
         scrape_html = is_oil_gas and (i == 0)
         if scrape_html:
             print(f"  Fetching 10-K HTML for FY{fy} (PV-10 / reserves)...")
 
         metrics = extract_year(
-            facts             = facts,
-            fiscal_year       = fy,
-            ebitda_series     = ebitda_series,
-            is_oil_gas        = is_oil_gas,
-            cik               = cik,
-            accession         = acc,
+            facts              = facts,
+            fiscal_year        = fy,
+            ebitda_series      = ebitda_series,
+            is_oil_gas         = is_oil_gas,
+            cik                = cik,
+            accession          = acc,
             original_accession = orig,
-            scrape_html       = scrape_html,
+            scrape_html        = scrape_html,
         )
         years_data.append((fy, metrics))
 
-    return ticker, company_name, is_oil_gas, years_data
+    return ticker, company_name, is_oil_gas, years_data, False
+
+
+def _extract_trust(
+    ticker: str,
+    company_name: str,
+    cik: str,
+    is_oil_gas: bool,
+    filings: list[dict],
+    num_years: int,
+) -> tuple[str, str, bool, list[tuple[str, dict]], bool]:
+    """
+    Trust-mode extraction: scrape HTML from each 10-K filing.
+    The most recent 10-K often contains 3-year comparative income data
+    and 2-year comparative balance sheet data in a single document.
+    We fetch up to two filings to cover three full years.
+    """
+    all_year_data: dict[str, dict] = {}
+
+    for i, filing in enumerate(filings):
+        fy  = filing["fiscal_year"]
+        acc = filing["accession"]
+        orig = filing["original_accession"]
+        print(f"  Fetching 10-K HTML for FY{fy}...")
+
+        accs = [acc]
+        if orig != acc:
+            accs.append(orig)
+
+        html_text = ""
+        for a in accs:
+            html_text = fetch_10k_html(cik, a)
+            if html_text:
+                break
+
+        if not html_text:
+            print(f"    [warn] Could not fetch HTML for FY{fy}.")
+            all_year_data.setdefault(fy, _empty_metrics())
+            continue
+
+        scraped = scrape_trust_all_years(html_text, fy, is_oil_gas)
+        for yr, m in scraped.items():
+            # Don't overwrite data already found from a more-recent filing
+            if yr not in all_year_data:
+                all_year_data[yr] = m
+
+        # The most recent filing already gives us 3 years of income data;
+        # stop fetching HTML unless we still have gaps
+        wanted = {f["fiscal_year"] for f in filings}
+        if wanted.issubset(all_year_data.keys()):
+            break
+
+    # Build ordered list matching the filings order
+    years_data = [(f["fiscal_year"], all_year_data.get(f["fiscal_year"], _empty_metrics()))
+                  for f in filings]
+
+    return ticker, company_name, is_oil_gas, years_data, True
+
+
+def _empty_metrics() -> dict:
+    return {k: None for k in METRIC_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -819,8 +1193,8 @@ def main() -> None:
         try:
             result = extract_ticker(ticker, args.years)
             all_results.append(result)
-            ticker, company_name, is_oil_gas, years_data = result
-            print_company_table(ticker, company_name, is_oil_gas, years_data)
+            t, company_name, is_oil_gas, years_data, is_trust = result
+            print_company_table(t, company_name, is_oil_gas, years_data, is_trust)
         except Exception as exc:
             errors.append((ticker, str(exc)))
             print(f"\n  [ERROR] {ticker}: {exc}", file=sys.stderr)
