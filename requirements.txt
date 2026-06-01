@@ -3,4 +3,5 @@ beautifulsoup4
 lxml
 tabulate
 openpyxl
+pandas
 streamlit
