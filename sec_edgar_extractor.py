@@ -26,11 +26,35 @@ def get_cik(ticker: str) -> str:
     raise ValueError(f"Ticker '{ticker}' not found in EDGAR.")
 
 
-def get_company_name(cik: str) -> str:
+def get_company_info(cik: str) -> tuple:
+    """Return (company_name, sic_code) from the EDGAR submissions endpoint."""
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     resp = requests.get(url, headers=HEADERS)
     resp.raise_for_status()
-    return resp.json().get("name", "Unknown Company")
+    data = resp.json()
+    name = data.get("name", "Unknown Company")
+    sic  = int(data.get("sic", 0) or 0)
+    return name, sic
+
+
+# SIC codes for oil, gas, and mining exploration/production companies
+# 1311 Crude Petroleum & Natural Gas, 1381-1389 Oil & Gas Field Services,
+# 1311-1382 range covers upstream E&P broadly
+OIL_GAS_SIC_CODES = {
+    1311,  # Crude Petroleum & Natural Gas
+    1381,  # Drilling Oil & Gas Wells
+    1382,  # Oil & Gas Field Services
+    1389,  # Services-Oil & Gas Field, NEC
+    2911,  # Petroleum Refining
+    5171,  # Petroleum & Petroleum Products Wholesalers
+    5172,  # Petroleum & Petroleum Products Wholesalers, NEC
+    1321,  # Natural Gas Liquids
+}
+
+
+def ebitda_label(sic: int) -> str:
+    """Return 'EBITDAX' for oil & gas SIC codes, 'EBITDA' for all others."""
+    return "EBITDAX" if sic in OIL_GAS_SIC_CODES else "EBITDA"
 
 
 def get_facts(cik: str) -> dict:
@@ -377,7 +401,8 @@ def set_column_widths(ws, years_count: int):
 
 # ── SHEET WRITERS ──────────────────────────────────────────────────────────────
 
-def write_income_sheet(wb, company_name: str, years: list, income_data: dict):
+def write_income_sheet(wb, company_name: str, years: list, income_data: dict,
+                       ebitda_row_label: str = "EBITDA"):
     ws = wb.active
     ws.title = "Income Statement"
     num_cols = 2 + (len(years) + 1) * 2
@@ -390,7 +415,7 @@ def write_income_sheet(wb, company_name: str, years: list, income_data: dict):
     rows = [
         ("Income / Revenue",                          "Revenue",                              True),
         ("Operating Expenses",                        "Total Expenses",                       True),
-        ("EBITDAX",                                   "EBITDAX",                              True),
+        (ebitda_row_label,                            "EBITDAX",                              True),
         ("Depreciation / Depletion / Amortization",  "Depreciation / Depletion / Amortization", False),
         ("Other Income / Expense",                   "Other Income / Expense",               False),
         ("Net Income",                               "Net Income",                           True),
@@ -459,8 +484,9 @@ def write_balance_sheet(wb, company_name: str, years: list, bs_data: dict):
 def build_workbook(ticker: str, num_years: int = 3) -> str:
     print(f"Looking up CIK for {ticker.upper()}...")
     cik = get_cik(ticker)
-    company_name = get_company_name(cik)
-    print(f"Found: {company_name} (CIK {cik})")
+    company_name, sic = get_company_info(cik)
+    label = ebitda_label(sic)
+    print(f"Found: {company_name} (CIK {cik}, SIC {sic}) → using '{label}'")
 
     print("Fetching XBRL facts...")
     facts = get_facts(cik)
@@ -490,7 +516,7 @@ def build_workbook(ticker: str, num_years: int = 3) -> str:
     # Build Excel
     print("Building Excel workbook...")
     wb = openpyxl.Workbook()
-    write_income_sheet(wb, company_name, years, income_data)
+    write_income_sheet(wb, company_name, years, income_data, ebitda_row_label=label)
     write_balance_sheet(wb, company_name, years, bs_data)
 
     filename = f"{ticker.upper()}_financials.xlsx"

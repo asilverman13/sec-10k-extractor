@@ -10,8 +10,8 @@ import streamlit as st
 import openpyxl
 
 from sec_edgar_extractor import (
-    get_cik, get_company_name, get_facts,
-    fetch_row, compute_ebitdax,
+    get_cik, get_company_info, get_facts,
+    fetch_row, compute_ebitdax, ebitda_label,
     INCOME_CONCEPTS, BALANCE_CONCEPTS,
     write_income_sheet, write_balance_sheet,
 )
@@ -57,7 +57,8 @@ def build_preview(data: dict, years: list, base_key: str) -> list[dict]:
     return rows
 
 
-BOLD_INCOME  = {"Income / Revenue", "Operating Expenses", "EBITDAX", "Net Income"}
+# Built dynamically per-run once we know the company's SIC code (see below)
+BOLD_INCOME_BASE = {"Income / Revenue", "Operating Expenses", "Net Income"}
 BOLD_BALANCE = {
     "Total Current Assets", "Total Assets",
     "Total Current Liabilities", "Total Liabilities",
@@ -92,11 +93,13 @@ def show_table(rows: list[dict], bold_set: set, years: list):
 
 if run and ticker:
     try:
-        # 1. Resolve ticker → CIK
+        # 1. Resolve ticker → CIK + SIC
         with st.spinner(f"Looking up {ticker}…"):
             cik = get_cik(ticker)
-            company_name = get_company_name(cik)
-        st.success(f"**{company_name}** (CIK {int(cik)})")
+            company_name, sic = get_company_info(cik)
+        eb_label = ebitda_label(sic)
+        bold_income = BOLD_INCOME_BASE | {eb_label}
+        st.success(f"**{company_name}** (CIK {int(cik)}, SIC {sic})")
 
         # 2. Fetch XBRL facts
         with st.spinner("Fetching XBRL data from SEC EDGAR…"):
@@ -126,7 +129,7 @@ if run and ticker:
 
         # 6. Build Excel in memory
         wb = openpyxl.Workbook()
-        write_income_sheet(wb, company_name, years, income_data)
+        write_income_sheet(wb, company_name, years, income_data, ebitda_row_label=eb_label)
         write_balance_sheet(wb, company_name, years, bs_data)
         buf = io.BytesIO()
         wb.save(buf)
@@ -150,14 +153,14 @@ if run and ticker:
         income_display = {
             "Income / Revenue":                        income_data.get("Revenue", {}),
             "Operating Expenses":                      income_data.get("Total Expenses", {}),
-            "EBITDAX":                                 income_data.get("EBITDAX", {}),
+            eb_label:                                  income_data.get("EBITDAX", {}),
             "Depreciation / Depletion / Amortization": income_data.get("Depreciation / Depletion / Amortization", {}),
             "Other Income / Expense":                  income_data.get("Other Income / Expense", {}),
             "Net Income":                              income_data.get("Net Income", {}),
             "Distributions":                           income_data.get("Distributions", {}),
         }
 
-        show_table(build_preview(income_display, years, "Revenue"), BOLD_INCOME, years)
+        show_table(build_preview(income_display, years, "Revenue"), bold_income, years)
 
         st.divider()
 
