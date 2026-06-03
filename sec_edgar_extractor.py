@@ -393,7 +393,7 @@ def write_data_row(ws, row: int, label: str, values: list,
 
 def write_footer(ws, row: int, num_cols: int):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=num_cols)
-    set_cell(ws, row, 1, "Source: SEC EDGAR Filing",
+    set_cell(ws, row, 1, "Source: SEC EDGAR Filings",
              font=ITALIC, align=Alignment(horizontal="left"))
 
 
