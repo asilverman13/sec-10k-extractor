@@ -393,7 +393,7 @@ def write_data_row(ws, row: int, label: str, values: list,
 
 def write_footer(ws, row: int, num_cols: int):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=num_cols)
-    set_cell(ws, row, 1, "Source: Compiled Financial Statements",
+    set_cell(ws, row, 1, "Source: SEC EDGAR Filing",
              font=ITALIC, align=Alignment(horizontal="left"))
 
 
@@ -502,7 +502,7 @@ def build_workbook(ticker: str, num_years: int = 3) -> str:
     available_years = sorted([y for y, v in probe.items() if v is not None], reverse=True)
     if not available_years:
         raise ValueError("No annual Net Income data found for this company.")
-    years = sorted(available_years[:num_years])
+    years = sorted(available_years[:num_years], reverse=True)
     print(f"Using years: {years}")
 
     # Fetch income statement
