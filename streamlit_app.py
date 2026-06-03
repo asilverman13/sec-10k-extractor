@@ -111,7 +111,7 @@ if run and ticker:
         if not available:
             st.error("No annual Net Income data found for this ticker.")
             st.stop()
-        years = sorted(available[:num_years])
+        years = sorted(available[:num_years], reverse=True)
         st.info(f"Fiscal years: {', '.join(str(y) for y in years)}")
 
         # 4. Fetch income statement
