@@ -325,10 +325,15 @@ def write_header_block(ws, start_row: int, company_name: str, sheet_title: str, 
 
 
 def write_data_row(ws, row: int, label: str, values: list,
-                   bold=False, shaded=False, italic=False, base_row=None):
+                   bold=False, shaded=False, italic=False, base_values: list = None):
     """
-    base_row: Excel row number of the base row (Revenue or Total Assets).
-              % cells are live formulas dividing this row's $ by that row's $.
+    values:       raw EDGAR dollar values (full dollars) for each year.
+    base_values:  raw EDGAR dollar values for the base row (Revenue / Total Assets).
+                  Used to compute common-size percentages.
+
+    All values are written as static numbers so every application (Excel,
+    Numbers, LibreOffice) displays them correctly without formula recalculation.
+    Percentages are stored as decimals (e.g. 0.253) with number_format '0.0%'.
     """
     fill = GRAY_FILL if shaded else None
     font = BOLD if bold else (ITALIC if italic else NORMAL)
@@ -339,11 +344,10 @@ def write_data_row(ws, row: int, label: str, values: list,
              align=Alignment(indent=0 if bold else 1))
 
     n_years = len(values)
-    # Dollar column for each year: C=3, E=5, G=7, …
     dollar_cols = [3 + i * 2 for i in range(n_years)]
     avg_dollar_col = 3 + n_years * 2
 
-    # Write year dollar values (raw EDGAR dollars ÷ 1,000 → thousands)
+    # ── Year dollar values ────────────────────────────────────────────────
     for i, v in enumerate(values):
         col = dollar_cols[i]
         if v is not None:
@@ -355,32 +359,36 @@ def write_data_row(ws, row: int, label: str, values: list,
             set_cell(ws, row, col, None, font=font, fill=fill,
                      align=Alignment(horizontal="right"))
 
-    # Average dollar: live AVERAGE formula so edits propagate
-    year_refs = ",".join(f"{get_column_letter(c)}{row}" for c in dollar_cols)
+    # ── Average dollar value (Python-computed) ────────────────────────────
+    valid = [v for v in values if v is not None]
+    avg_val = (sum(valid) / len(valid) / 1_000_000) if valid else None
     set_cell(ws, row, avg_dollar_col,
-             f"=IFERROR(AVERAGE({year_refs}),\"\")",
+             avg_val if avg_val is not None else None,
              font=font, fill=fill,
              align=Alignment(horizontal="right"),
-             number_format='#,##0')
+             number_format='#,##0' if avg_val is not None else None)
 
-    # % formulas: each cell = dollar_cell / base_dollar_cell
-    if base_row is not None:
-        for col in dollar_cols:
-            val_ref  = f"{get_column_letter(col)}{row}"
-            base_ref = f"{get_column_letter(col)}{base_row}"
-            formula  = f'=IF(OR({val_ref}="",{base_ref}=0),"",{val_ref}/{base_ref})'
-            set_cell(ws, row, col + 1, formula,
+    # ── Common-size % columns (Python-computed decimals) ──────────────────
+    if base_values is not None:
+        valid_bases = [b for b in base_values if b is not None]
+        avg_base = sum(valid_bases) / len(valid_bases) if valid_bases else None
+
+        for i, (v, b) in enumerate(zip(values, base_values)):
+            pct = (v / b) if (v is not None and b) else None
+            col = dollar_cols[i] + 1
+            set_cell(ws, row, col,
+                     pct if pct is not None else None,
                      font=font, fill=fill,
                      align=Alignment(horizontal="right"),
-                     number_format='0.0%')
-        # Average % references the average dollar cells
-        avg_val_ref  = f"{get_column_letter(avg_dollar_col)}{row}"
-        avg_base_ref = f"{get_column_letter(avg_dollar_col)}{base_row}"
+                     number_format='0.0%' if pct is not None else None)
+
+        # Average %
+        avg_pct = (avg_val * 1_000_000 / avg_base) if (avg_val is not None and avg_base) else None
         set_cell(ws, row, avg_dollar_col + 1,
-                 f'=IF(OR({avg_val_ref}="",{avg_base_ref}=0),"",{avg_val_ref}/{avg_base_ref})',
+                 avg_pct if avg_pct is not None else None,
                  font=font, fill=fill,
                  align=Alignment(horizontal="right"),
-                 number_format='0.0%')
+                 number_format='0.0%' if avg_pct is not None else None)
 
 
 def write_footer(ws, row: int, num_cols: int):
@@ -410,7 +418,7 @@ def write_income_sheet(wb, company_name: str, years: list, income_data: dict,
     r = write_header_block(ws, 1, company_name,
                            "Income Statements ($) and Common Size-Equivalents", years)
 
-    revenue_row = r  # Revenue is always the first data row; all % formulas divide by it
+    revenue_vals = [income_data.get("Revenue", {}).get(y) for y in years]
 
     rows = [
         ("Income / Revenue",                          "Revenue",                              True),
@@ -424,7 +432,7 @@ def write_income_sheet(wb, company_name: str, years: list, income_data: dict,
 
     for label, key, bold in rows:
         vals = [income_data.get(key, {}).get(y) for y in years]
-        write_data_row(ws, r, label, vals, bold=bold, base_row=revenue_row)
+        write_data_row(ws, r, label, vals, bold=bold, base_values=revenue_vals)
         r += 1
 
     write_footer(ws, r + 1, num_cols)
@@ -438,10 +446,7 @@ def write_balance_sheet(wb, company_name: str, years: list, bs_data: dict):
     r = write_header_block(ws, 1, company_name,
                            "Balance Sheets ($) and Common Size-Equivalents", years)
 
-    # Pre-compute Total Assets row so % formulas on rows above it are correct.
-    # Layout after header: Assets-header(+1), Cash(+1), OCA(+1), TCA(+1),
-    #                       FixedAssets(+1), OtherNCA(+1), TotalAssets(+1) → offset 6
-    total_assets_row = r + 6
+    total_assets_vals = [bs_data.get("Total Assets", {}).get(y) for y in years]
 
     all_rows = [
         # (display label,               data key,                                   bold,  section_header)
@@ -472,7 +477,7 @@ def write_balance_sheet(wb, company_name: str, years: list, bs_data: dict):
             r += 1
             continue
         vals = [bs_data.get(key, {}).get(y) for y in years]
-        write_data_row(ws, r, label, vals, bold=bold, base_row=total_assets_row)
+        write_data_row(ws, r, label, vals, bold=bold, base_values=total_assets_vals)
         r += 1
 
     write_footer(ws, r + 1, num_cols)
