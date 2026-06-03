@@ -57,7 +57,7 @@ def build_preview(data: dict, years: list, base_key: str) -> list[dict]:
     return rows
 
 
-BOLD_INCOME  = {"Income / Revenue", "Total Expenses", "EBITDAX", "Net Income"}
+BOLD_INCOME  = {"Income / Revenue", "Operating Expenses", "EBITDAX", "Net Income"}
 BOLD_BALANCE = {
     "Total Current Assets", "Total Assets",
     "Total Current Liabilities", "Total Liabilities",
@@ -149,7 +149,7 @@ if run and ticker:
 
         income_display = {
             "Income / Revenue":                        income_data.get("Revenue", {}),
-            "Total Expenses":                          income_data.get("Total Expenses", {}),
+            "Operating Expenses":                      income_data.get("Total Expenses", {}),
             "EBITDAX":                                 income_data.get("EBITDAX", {}),
             "Depreciation / Depletion / Amortization": income_data.get("Depreciation / Depletion / Amortization", {}),
             "Other Income / Expense":                  income_data.get("Other Income / Expense", {}),

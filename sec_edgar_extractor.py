@@ -389,7 +389,7 @@ def write_income_sheet(wb, company_name: str, years: list, income_data: dict):
 
     rows = [
         ("Income / Revenue",                          "Revenue",                              True),
-        ("Total Expenses",                            "Total Expenses",                       True),
+        ("Operating Expenses",                        "Total Expenses",                       True),
         ("EBITDAX",                                   "EBITDAX",                              True),
         ("Depreciation / Depletion / Amortization",  "Depreciation / Depletion / Amortization", False),
         ("Other Income / Expense",                   "Other Income / Expense",               False),
