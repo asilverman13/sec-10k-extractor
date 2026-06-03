@@ -355,7 +355,7 @@ def write_data_row(ws, row: int, label: str, values: list,
             set_cell(ws, row, col, v / 1_000_000,
                      font=font, fill=fill,
                      align=Alignment(horizontal="right"),
-                     number_format='#,##0')
+                     number_format='#,##0.00')
         else:
             set_cell(ws, row, col, None, font=font, fill=fill,
                      align=Alignment(horizontal="right"))
@@ -367,7 +367,7 @@ def write_data_row(ws, row: int, label: str, values: list,
              avg_val if avg_val is not None else None,
              font=font, fill=fill,
              align=Alignment(horizontal="right"),
-             number_format='#,##0' if avg_val is not None else None)
+             number_format='#,##0.00' if avg_val is not None else None)
 
     # ── Common-size % columns (Python-computed decimals) ──────────────────
     if base_values is not None:
