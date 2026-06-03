@@ -301,12 +301,13 @@ def write_header_block(ws, start_row: int, company_name: str, sheet_title: str, 
     set_cell(ws, r, col, "(in U.S. $)", font=HEADER_FONT, fill=GRAY_FILL)
     col += 1
 
-    col_labels = [str(y) for y in years] + ["Average"]
+    col_labels = list(years) + ["Average"]
     for label in col_labels:
         ws.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + 1)
         set_cell(ws, r, col, label,
                  font=HEADER_FONT, fill=GRAY_FILL,
-                 align=Alignment(horizontal="center"))
+                 align=Alignment(horizontal="center"),
+                 number_format='0' if isinstance(label, int) else None)
         col += 2
 
     r += 1
